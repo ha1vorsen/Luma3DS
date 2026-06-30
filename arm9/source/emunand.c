@@ -46,7 +46,10 @@ typedef enum
 {
     FILE_EMUNAND_NOT_FOUND,
     FILE_EMUNAND_VALID,
-    FILE_EMUNAND_INVALID,
+    FILE_EMUNAND_OPEN_FAILED,
+    FILE_EMUNAND_BAD_SIZE,
+    FILE_EMUNAND_FRAGMENTED,
+    FILE_EMUNAND_BAD_NCSD,
 } FileEmuNandStatus;
 
 // Walk the FAT32 cluster chain from sclust for nClusters entries, verifying
@@ -132,11 +135,28 @@ static bool findFileEmuNandPath(char *path, u32 pathSize, u32 emunandIndex)
     return found;
 }
 
+static u32 getNcsdMinimumSectors(const u8 *ncsd)
+{
+    u32 minSectors = 0;
+    const u32 *partitionTable = (const u32 *)(ncsd + 0x120);
+
+    for(u32 i = 0; i < 8; i++)
+    {
+        u32 offset = partitionTable[2 * i];
+        u32 size = partitionTable[2 * i + 1];
+
+        if(size != 0 && offset + size > minSectors)
+            minSectors = offset + size;
+    }
+
+    return minSectors;
+}
+
 // Attempt to resolve the selected file-based emuNAND image.
 // Verifies size, contiguity and NCSD magic, then sets *startLBAOut to the
 // image's absolute SD sector 0 (ready to be stored in emuOffset).
 // sectorBuf is a caller-provided 512-byte aligned scratch buffer.
-static FileEmuNandStatus tryLocateFileEmuNand(u8 *sectorBuf, u32 *startLBAOut, u32 emunandIndex, u32 nandSize)
+static FileEmuNandStatus tryLocateFileEmuNand(u8 *sectorBuf, u32 *startLBAOut, u32 emunandIndex)
 {
     static FIL fil;
     char path[FF_LFN_BUF + 16];
@@ -145,15 +165,15 @@ static FileEmuNandStatus tryLocateFileEmuNand(u8 *sectorBuf, u32 *startLBAOut, u
         return FILE_EMUNAND_NOT_FOUND;
 
     if(f_open(&fil, path, FA_READ | FA_OPEN_EXISTING) != FR_OK)
-        return FILE_EMUNAND_INVALID;
+        return FILE_EMUNAND_OPEN_FAILED;
 
-    FileEmuNandStatus result = FILE_EMUNAND_INVALID;
+    FileEmuNandStatus result = FILE_EMUNAND_BAD_SIZE;
     FATFS *fs      = fil.obj.fs;
     DWORD  sclust  = fil.obj.sclust;
     FSIZE_t fileSize = fil.obj.objsize;
 
     if(fs == NULL || sclust < 2u || fileSize == 0u) goto out;
-    if(fileSize < (FSIZE_t)nandSize * 512u || (fileSize & 0x1FFu) != 0) goto out;
+    if((fileSize & 0x1FFu) != 0) goto out;
 
     // Cluster size in bytes; FF_MAX_SS == FF_MIN_SS == 512 in this build
     u32 clusterBytes = (u32)fs->csize * 512u;
@@ -163,11 +183,26 @@ static FileEmuNandStatus tryLocateFileEmuNand(u8 *sectorBuf, u32 *startLBAOut, u
     //   database already includes the partition base, so this is an absolute LBA.
     u32 startLBA = (u32)fs->database + (u32)fs->csize * (sclust - 2u);
 
-    if(!isClusterChainContiguous(fs, sclust, nClusters, sectorBuf)) goto out;
+    if(!isClusterChainContiguous(fs, sclust, nClusters, sectorBuf))
+    {
+        result = FILE_EMUNAND_FRAGMENTED;
+        goto out;
+    }
 
     // Image sector 0 must carry NCSD magic at offset 0x100
     if(sdmmc_sdcard_readsectors(startLBA, 1, sectorBuf) != 0) goto out;
-    if(memcmp(sectorBuf + 0x100, "NCSD", 4) != 0) goto out;
+    if(memcmp(sectorBuf + 0x100, "NCSD", 4) != 0)
+    {
+        result = FILE_EMUNAND_BAD_NCSD;
+        goto out;
+    }
+
+    u32 minSectors = getNcsdMinimumSectors(sectorBuf);
+    if(minSectors == 0 || fileSize / 512u < minSectors)
+    {
+        result = FILE_EMUNAND_BAD_SIZE;
+        goto out;
+    }
 
     *startLBAOut = startLBA;
     result = FILE_EMUNAND_VALID;
@@ -196,7 +231,7 @@ void locateEmuNand(FirmwareSource *nandType, u32 *emunandIndex, bool configureCt
     if(CONFIG(EMUNANDUSEFILEPATH) && isSdMode)
     {
         u32 startLBA;
-        FileEmuNandStatus fileStatus = tryLocateFileEmuNand(temp, &startLBA, *emunandIndex, nandSize);
+        FileEmuNandStatus fileStatus = tryLocateFileEmuNand(temp, &startLBA, *emunandIndex);
         if(fileStatus == FILE_EMUNAND_VALID)
         {
             if(configureCtrNandParams)
@@ -206,8 +241,16 @@ void locateEmuNand(FirmwareSource *nandType, u32 *emunandIndex, bool configureCt
             }
             return;
         }
-        else if(fileStatus == FILE_EMUNAND_INVALID && configureCtrNandParams)
-            error("The selected file-based EmuNAND is invalid.\nIt must be a full-size, contiguous NAND image.");
+        else if(fileStatus != FILE_EMUNAND_NOT_FOUND && configureCtrNandParams)
+        {
+            const char *reason = "invalid";
+            if(fileStatus == FILE_EMUNAND_OPEN_FAILED) reason = "could not be opened";
+            else if(fileStatus == FILE_EMUNAND_BAD_SIZE) reason = "has an invalid size";
+            else if(fileStatus == FILE_EMUNAND_FRAGMENTED) reason = "is fragmented";
+            else if(fileStatus == FILE_EMUNAND_BAD_NCSD) reason = "has an invalid NCSD header";
+
+            error("The selected file-based EmuNAND %s.\nIt must be sector-aligned and contiguous.", reason);
+        }
     }
 
     /*if (*nandType == FIRMWARE_SYSNAND)
