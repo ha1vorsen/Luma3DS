@@ -372,7 +372,12 @@ static int configIniHandler(void* user, const char* section, const char* name, c
 
         // Multi-choice options displayed on the Luma3DS boot screen
 
-        if (strcmp(name, "default_emunand_number") == 0) {
+        if (strcmp(name, "use_file_emunand_path") == 0) {
+            bool opt;
+            CHECK_PARSE_OPTION(parseBoolOption(&opt, value));
+            cfg->config |= (u32)opt << (u32)EMUNANDUSEFILEPATH;
+            return 1;
+        } else if (strcmp(name, "default_emunand_number") == 0) {
             s64 opt;
             CHECK_PARSE_OPTION(parseDecIntOption(&opt, value, 1, 4));
             cfg->multiConfig |= (opt - 1) << (2 * (u32)DEFAULTEMU);
@@ -663,7 +668,8 @@ static size_t saveLumaIniConfigToStr(char *out)
         lumaVerStr, lumaRevSuffixStr,
 
         (int)CONFIG_VERSIONMAJOR, (int)CONFIG_VERSIONMINOR,
-        (int)CONFIG(AUTOBOOTEMU), (int)CONFIG(LOADEXTFIRMSANDMODULES),
+        (int)CONFIG(AUTOBOOTEMU), (int)CONFIG(EMUNANDUSEFILEPATH),
+        (int)CONFIG(LOADEXTFIRMSANDMODULES),
         (int)CONFIG(PATCHGAMES), (int)CONFIG(REDIRECTAPPTHREADS),
         (int)CONFIG(PATCHVERSTRING), (int)CONFIG(SHOWGBABOOT),
 
@@ -850,6 +856,7 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
                                              };
 
     static const char *singleOptionsText[] = { "( ) Autoboot EmuNAND",
+                                               "( ) Use file-based EmuNAND",
                                                "( ) Enable loading external FIRMs and modules",
                                                "( ) Enable game patching",
                                                "( ) Redirect app. syscore threads to core2",
@@ -860,6 +867,16 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
                                                "\nBoot chainloader",
                                                "Save and exit"
                                              };
+
+    static const u32 singleOptionsConfigMap[] = {
+        AUTOBOOTEMU,
+        EMUNANDUSEFILEPATH,
+        LOADEXTFIRMSANDMODULES,
+        PATCHGAMES,
+        REDIRECTAPPTHREADS,
+        PATCHVERSTRING,
+        SHOWGBABOOT,
+    };
 
     static const char *optionsDescription[]  = { "Select the default EmuNAND.\n\n"
                                                  "It will be booted when no directional\n"
@@ -909,6 +926,14 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
                                                  "default, hold a directional pad button\n"
                                                  "(Up/Right/Down/Left equal EmuNANDs\n"
                                                  "1/2/3/4).",
+
+                                                 "Use a file-based EmuNAND from\n"
+                                                 "/luma/emunand/.\n\n"
+                                                 "In there, the first EmuNAND is\n"
+						 "nand*.bin; then EmuNANDs 2-4\n"
+                                                 "nand2*.bin, nand3*.bin, and so on.\n\n"
+						 "These are used separately from \n"
+						 "partition-based emuNAND.",
 
                                                  "Enable loading external FIRMs and\n"
                                                  "system modules.\n\n"
@@ -967,7 +992,7 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
         u32 enabled;
         bool visible;
     } multiOptions[] = {
-        { .visible = nandType == FIRMWARE_EMUNAND },
+        { .visible = isSdMode || nandType == FIRMWARE_EMUNAND },
         { .visible = true },
         { .visible = true },
         { .visible = true },
@@ -981,7 +1006,8 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
         bool enabled;
         bool visible;
     } singleOptions[] = {
-        { .visible = nandType == FIRMWARE_EMUNAND },
+        { .visible = isSdMode || nandType == FIRMWARE_EMUNAND },
+        { .visible = isSdMode },
         { .visible = true },
         { .visible = true },
         { .visible = ISN3DS },
@@ -1010,8 +1036,8 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
 
         multiOptions[i].enabled = MULTICONFIG(i);
     }
-    for(u32 i = 0; i < singleOptionsAmount; i++)
-        singleOptions[i].enabled = CONFIG(i);
+    for(u32 i = 0; i < sizeof(singleOptionsConfigMap) / sizeof(singleOptionsConfigMap[0]); i++)
+        singleOptions[i].enabled = CONFIG(singleOptionsConfigMap[i]);
 
     initScreens();
 
@@ -1189,9 +1215,11 @@ void configMenu(bool oldPinStatus, u32 oldPinMode)
     for(u32 i = 0; i < multiOptionsAmount; i++)
         configData.multiConfig |= multiOptions[i].enabled << (i * 2);
 
-    configData.config &= ~((1 << (u32)NUMCONFIGURABLE) - 1);
-    for(u32 i = 0; i < singleOptionsAmount; i++)
-        configData.config |= (singleOptions[i].enabled ? 1 : 0) << i;
+    for(u32 i = 0; i < sizeof(singleOptionsConfigMap) / sizeof(singleOptionsConfigMap[0]); i++)
+    {
+        configData.config &= ~(1u << singleOptionsConfigMap[i]);
+        configData.config |= (singleOptions[i].enabled ? 1u : 0u) << singleOptionsConfigMap[i];
+    }
 
     writeConfig(true);
 

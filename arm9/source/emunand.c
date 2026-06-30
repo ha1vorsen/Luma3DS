@@ -30,13 +30,144 @@
 
 
 #include "emunand.h"
+#include "config.h"
 #include "memory.h"
 #include "utils.h"
+#include "fatfs/ff.h"
 #include "fatfs/sdmmc/sdmmc.h"
 #include "large_patches.h"
+#include <stdio.h>
+#include <strings.h>
 
 u32 emuOffset,
     emuHeader;
+
+// Walk the FAT32 cluster chain from sclust for nClusters entries, verifying
+// each FAT entry points to the immediately following cluster (contiguous).
+// sectorBuf must be a 512-byte aligned buffer used as a scratch read window.
+static bool isClusterChainContiguous(FATFS *fs, DWORD sclust, u32 nClusters, u8 *sectorBuf)
+{
+    if(fs->fs_type != FS_FAT32) return false;
+    if(nClusters <= 1) return true;
+
+    DWORD clst = sclust;
+    u32 lastFatSect = 0xFFFFFFFFu;
+
+    for(u32 i = 0; i < nClusters - 1u; i++)
+    {
+        u32 fatSect = (u32)fs->fatbase + (clst * 4u) / 512u;
+        u32 fatOff  = (clst * 4u) % 512u;
+
+        if(fatSect != lastFatSect)
+        {
+            if(sdmmc_sdcard_readsectors(fatSect, 1, sectorBuf) != 0)
+                return false;
+            lastFatSect = fatSect;
+        }
+
+        u32 nextClst = (*(u32 *)(sectorBuf + fatOff)) & 0x0FFFFFFFu;
+        if(nextClst != clst + 1u) return false;
+        clst++;
+    }
+
+    return true;
+}
+
+static bool findFileEmuNandPath(char *path, u32 pathSize, u32 emunandIndex)
+{
+    char prefix[16];
+
+    if(emunandIndex == 0)
+        sprintf(prefix, "%s1", EMUNAND_FILE_NAME_PREFIX);
+    else
+        sprintf(prefix, "%s%lu", EMUNAND_FILE_NAME_PREFIX, emunandIndex + 1);
+
+    u32 prefixLen = strlen(prefix);
+
+    DIR dir;
+    if(f_opendir(&dir, EMUNAND_FILE_DIR) != FR_OK)
+        return false;
+
+    bool found = false;
+    char bestName[FF_LFN_BUF + 1];
+    FILINFO info;
+
+    while(f_readdir(&dir, &info) == FR_OK && info.fname[0] != 0)
+    {
+        if((info.fattrib & AM_DIR) != 0) continue;
+
+        u32 nameLen = strlen(info.fname);
+        if(nameLen < 4) continue;
+        if(strcasecmp(info.fname + nameLen - 4, ".bin") != 0) continue;
+
+        if(emunandIndex == 0)
+        {
+            if(strcasecmp(info.fname, EMUNAND_FILE_NAME_PREFIX ".bin") != 0 &&
+               strncasecmp(info.fname, prefix, prefixLen) != 0)
+                continue;
+        }
+        else if(strncasecmp(info.fname, prefix, prefixLen) != 0)
+            continue;
+
+        if(strlen(EMUNAND_FILE_DIR) + 1 + nameLen >= pathSize) continue;
+
+        if(!found || strcasecmp(info.fname, bestName) < 0 ||
+           (strcasecmp(info.fname, bestName) == 0 && strcmp(info.fname, bestName) < 0))
+            strcpy(bestName, info.fname);
+
+        found = true;
+    }
+
+    f_closedir(&dir);
+    if(found)
+        sprintf(path, "%s/%s", EMUNAND_FILE_DIR, bestName);
+
+    return found;
+}
+
+// Attempt to resolve the selected file-based emuNAND image.
+// Verifies contiguity and NCSD magic, then sets *startLBAOut to the image's
+// absolute SD sector 0 (ready to be stored in emuOffset). Returns true on success.
+// sectorBuf is a caller-provided 512-byte aligned scratch buffer.
+static bool tryLocateFileEmuNand(u8 *sectorBuf, u32 *startLBAOut, u32 emunandIndex)
+{
+    static FIL fil;
+    char path[FF_LFN_BUF + 16];
+
+    if(!findFileEmuNandPath(path, sizeof(path), emunandIndex))
+        return false;
+
+    if(f_open(&fil, path, FA_READ | FA_OPEN_EXISTING) != FR_OK)
+        return false;
+
+    bool result = false;
+    FATFS *fs      = fil.obj.fs;
+    DWORD  sclust  = fil.obj.sclust;
+    FSIZE_t fileSize = fil.obj.objsize;
+
+    if(fs == NULL || sclust < 2u || fileSize == 0u) goto out;
+
+    // Cluster size in bytes; FF_MAX_SS == FF_MIN_SS == 512 in this build
+    u32 clusterBytes = (u32)fs->csize * 512u;
+    u32 nClusters    = (u32)((fileSize + clusterBytes - 1u) / clusterBytes);
+
+    // Absolute SD LBA of the image's first sector — mirrors FatFs clst2sect():
+    //   database already includes the partition base, so this is an absolute LBA.
+    u32 startLBA = (u32)fs->database + (u32)fs->csize * (sclust - 2u);
+
+    if(!isClusterChainContiguous(fs, sclust, nClusters, sectorBuf)) goto out;
+
+    // Image sector 0 must carry NCSD magic at offset 0x100
+    if(sdmmc_sdcard_readsectors(startLBA, 1, sectorBuf) != 0) goto out;
+    if(memcmp(sectorBuf + 0x100, "NCSD", 4) != 0) goto out;
+
+    *startLBAOut = startLBA;
+    result = true;
+
+out:
+    f_close(&fil);
+    return result;
+}
 
 void locateEmuNand(FirmwareSource *nandType, u32 *emunandIndex, bool configureCtrNandParams)
 {
@@ -49,6 +180,24 @@ void locateEmuNand(FirmwareSource *nandType, u32 *emunandIndex, bool configureCt
         nandSize = getMMCDevice(0)->total_size;
         sdmmc_sdcard_readsectors(0, 1, temp);
         fatStart = *(u32 *)(temp + 0x1C6); //First sector of the FAT partition
+    }
+
+    // File-based emuNAND: supported when enabled and booting from SD.
+    // On success emuOffset is the file's absolute start LBA and we return early;
+    // on any failure (file absent, fragmented, bad magic) we fall through to the
+    // existing raw-partition detection below.
+    if(CONFIG(EMUNANDUSEFILEPATH) && isSdMode)
+    {
+        u32 startLBA;
+        if(tryLocateFileEmuNand(temp, &startLBA, *emunandIndex))
+        {
+            if(configureCtrNandParams)
+            {
+                emuOffset = startLBA;
+                emuHeader = 0;
+            }
+            return;
+        }
     }
 
     /*if (*nandType == FIRMWARE_SYSNAND)

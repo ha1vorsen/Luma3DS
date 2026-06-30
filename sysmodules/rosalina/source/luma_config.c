@@ -167,7 +167,8 @@ static size_t LumaConfig_SaveLumaIniConfigToStr(char *out, const CfgData *cfg)
         lumaVerStr, lumaRevSuffixStr,
 
         (int)cfg->formatVersionMajor, (int)cfg->formatVersionMinor,
-        (int)CONFIG(AUTOBOOTEMU), (int)CONFIG(LOADEXTFIRMSANDMODULES),
+        (int)CONFIG(AUTOBOOTEMU), (int)CONFIG(EMUNANDUSEFILEPATH),
+        (int)CONFIG(LOADEXTFIRMSANDMODULES),
         (int)CONFIG(PATCHGAMES), (int)CONFIG(REDIRECTAPPTHREADS),
         (int)CONFIG(PATCHVERSTRING), (int)CONFIG(SHOWGBABOOT),
 

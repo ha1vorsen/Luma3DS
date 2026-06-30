@@ -356,12 +356,10 @@ boot:
     }
 
     ctrNandLocation = nandType; // for CTRNAND partition
+    configData.bootConfig = ((bootType == NTR ? 1 : 0) << 4) | ((u32)isNoForceFlagSet << 3) | ((u32)emunandIndex << 1) | (u32)nandType;
 
     if(bootType != FIRMLAUNCH)
-    {
-        configData.bootConfig = ((bootType == NTR ? 1 : 0) << 4) | ((u32)isNoForceFlagSet << 3) | ((u32)emunandIndex << 1) | (u32)nandType;
         writeConfig(false);
-    }
 
     bool loadFromStorage = CONFIG(LOADEXTFIRMSANDMODULES);
     u32 firmVersion = loadNintendoFirm(&firmType, nandType, loadFromStorage, isSafeMode);

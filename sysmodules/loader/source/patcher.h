@@ -40,6 +40,7 @@ enum singleOptions
     ENABLEDSIEXTFILTER,
     DISABLEARM11EXCHANDLERS,
     ENABLESAFEFIRMROSALINA,
+    EMUNANDUSEFILEPATH,
 };
 
 extern u32 config, multiConfig, bootConfig;

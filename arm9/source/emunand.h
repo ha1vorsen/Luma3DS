@@ -34,6 +34,11 @@
 
 #define ROUND_TO_4MB(a) (((a) + 0x2000 - 1) & (~(0x2000 - 1)))
 
+// Backing files for file-based emuNAND must be contiguous raw NAND images
+// with sector 0 = NCSD header (redNAND layout, no partition prefix sector).
+#define EMUNAND_FILE_DIR "sdmc:/luma/emunand"
+#define EMUNAND_FILE_NAME_PREFIX "nand"
+
 extern u32 emuOffset,
            emuHeader;
 
