@@ -411,7 +411,10 @@ int ctrNandWrite(u32 sector, u32 sectorCount, const u8 *inbuf)
         aes(buffer, buffer, tempCount * 0x200 / AES_BLOCK_SIZE, tmpCtr, AES_CTR_MODE, AES_INPUT_BE | AES_INPUT_NORMAL);
 
         //Write
-        result = sdmmc_nand_writesectors(tempSector + sector + fatStart, tempCount, buffer);
+        if(ctrNandLocation == FIRMWARE_SYSNAND)
+            result = sdmmc_nand_writesectors(tempSector + sector + fatStart, tempCount, buffer);
+        else
+            result = sdmmc_sdcard_writesectors(tempSector + sector + fatStart + emuOffset, tempCount, buffer);
     }
 
     return result;

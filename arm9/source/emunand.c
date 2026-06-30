@@ -42,6 +42,13 @@
 u32 emuOffset,
     emuHeader;
 
+typedef enum
+{
+    FILE_EMUNAND_NOT_FOUND,
+    FILE_EMUNAND_VALID,
+    FILE_EMUNAND_INVALID,
+} FileEmuNandStatus;
+
 // Walk the FAT32 cluster chain from sclust for nClusters entries, verifying
 // each FAT entry points to the immediately following cluster (contiguous).
 // sectorBuf must be a 512-byte aligned buffer used as a scratch read window.
@@ -126,26 +133,27 @@ static bool findFileEmuNandPath(char *path, u32 pathSize, u32 emunandIndex)
 }
 
 // Attempt to resolve the selected file-based emuNAND image.
-// Verifies contiguity and NCSD magic, then sets *startLBAOut to the image's
-// absolute SD sector 0 (ready to be stored in emuOffset). Returns true on success.
+// Verifies size, contiguity and NCSD magic, then sets *startLBAOut to the
+// image's absolute SD sector 0 (ready to be stored in emuOffset).
 // sectorBuf is a caller-provided 512-byte aligned scratch buffer.
-static bool tryLocateFileEmuNand(u8 *sectorBuf, u32 *startLBAOut, u32 emunandIndex)
+static FileEmuNandStatus tryLocateFileEmuNand(u8 *sectorBuf, u32 *startLBAOut, u32 emunandIndex, u32 nandSize)
 {
     static FIL fil;
     char path[FF_LFN_BUF + 16];
 
     if(!findFileEmuNandPath(path, sizeof(path), emunandIndex))
-        return false;
+        return FILE_EMUNAND_NOT_FOUND;
 
     if(f_open(&fil, path, FA_READ | FA_OPEN_EXISTING) != FR_OK)
-        return false;
+        return FILE_EMUNAND_INVALID;
 
-    bool result = false;
+    FileEmuNandStatus result = FILE_EMUNAND_INVALID;
     FATFS *fs      = fil.obj.fs;
     DWORD  sclust  = fil.obj.sclust;
     FSIZE_t fileSize = fil.obj.objsize;
 
     if(fs == NULL || sclust < 2u || fileSize == 0u) goto out;
+    if(fileSize < (FSIZE_t)nandSize * 512u || (fileSize & 0x1FFu) != 0) goto out;
 
     // Cluster size in bytes; FF_MAX_SS == FF_MIN_SS == 512 in this build
     u32 clusterBytes = (u32)fs->csize * 512u;
@@ -162,7 +170,7 @@ static bool tryLocateFileEmuNand(u8 *sectorBuf, u32 *startLBAOut, u32 emunandInd
     if(memcmp(sectorBuf + 0x100, "NCSD", 4) != 0) goto out;
 
     *startLBAOut = startLBA;
-    result = true;
+    result = FILE_EMUNAND_VALID;
 
 out:
     f_close(&fil);
@@ -183,13 +191,13 @@ void locateEmuNand(FirmwareSource *nandType, u32 *emunandIndex, bool configureCt
     }
 
     // File-based emuNAND: supported when enabled and booting from SD.
-    // On success emuOffset is the file's absolute start LBA and we return early;
-    // on any failure (file absent, fragmented, bad magic) we fall through to the
-    // existing raw-partition detection below.
+    // If a matching file exists but is unsafe to use, fail closed instead of
+    // silently booting another NAND target.
     if(CONFIG(EMUNANDUSEFILEPATH) && isSdMode)
     {
         u32 startLBA;
-        if(tryLocateFileEmuNand(temp, &startLBA, *emunandIndex))
+        FileEmuNandStatus fileStatus = tryLocateFileEmuNand(temp, &startLBA, *emunandIndex, nandSize);
+        if(fileStatus == FILE_EMUNAND_VALID)
         {
             if(configureCtrNandParams)
             {
@@ -198,6 +206,8 @@ void locateEmuNand(FirmwareSource *nandType, u32 *emunandIndex, bool configureCt
             }
             return;
         }
+        else if(fileStatus == FILE_EMUNAND_INVALID && configureCtrNandParams)
+            error("The selected file-based EmuNAND is invalid.\nIt must be a full-size, contiguous NAND image.");
     }
 
     /*if (*nandType == FIRMWARE_SYSNAND)
